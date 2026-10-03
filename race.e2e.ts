@@ -4,7 +4,8 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCmuxRace, runBounded } from "./index.ts";
+import { runCmuxRace, runBounded, killGroup } from "./index.ts";
+import { spawn } from "node:child_process";
 
 delete process.env.TYPESAFE_API_KEY;
 const tmp = realpathSync(mkdtempSync(join(tmpdir(), "race-e2e-")));
@@ -119,9 +120,10 @@ console.log("✓ finished runner's background child killed via its process group
 
 // runBounded: a setsid escapee holding our pipes must not hang the call (settles, reports escaped)
 const t1 = Date.now();
-const esc = await runBounded("python3 -c 'import os,time; os.setsid(); time.sleep(7.7)' & true", { cwd: tmp, timeoutMs: 200 });
+const escPidFile = join(tmp, "escapee.pid");
+const esc = await runBounded(`python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(7.7)' '${escPidFile}' & true`, { cwd: tmp, timeoutMs: 200 });
 const took = Date.now() - t1;
-try { execFileSync("pkill", ["-f", "time.sleep\\(7.7\\)"]); } catch {}
+try { process.kill(Number(readFileSync(escPidFile, "utf8")), "SIGKILL"); } catch {} // exact PID only
 assert.ok(took < 6500, `runBounded hung for ${took} ms`);
 assert.equal(esc.timedOut, true);
 assert.equal(esc.escaped, true, "escape is reported");
@@ -133,5 +135,64 @@ const body = cap.out.replace(/\n… \(output truncated\)$/, "");
 assert.ok(Buffer.byteLength(body) <= 16 + 3, `cap exceeded: ${Buffer.byteLength(body)} bytes`); // +3: one replacement char at a cut
 assert.match(cap.out, /output truncated/);
 console.log("✓ output cap counts bytes and marks truncation");
+
+// Launch window: teardown lands after the pane started but before the job leader recorded its group.
+// The leader must then refuse to run the command (cancel marker), so nothing is left unowned.
+{
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "race-window-")));
+  const env = join(dir, "env.sh"), fk = join(dir, "cmux"), marker = join(dir, "marker"), wpid = join(dir, "wrapper.pid"), child = join(dir, "child.pid");
+  // pause every bash right before it records the job's process group
+  writeFileSync(env, `trap 'case "$BASH_COMMAND" in echo\\ \\$\\$*) echo ready > ${marker}; sleep 1.5;; esac' DEBUG\n`);
+  writeFileSync(fk, `#!/bin/bash
+if [ "$1" = new-split ]; then
+  while [ $# -gt 0 ]; do [ "$1" = --command ] && { BASH_ENV='${env}' bash -c "$2" >/dev/null 2>&1 & echo $! > '${wpid}'; break; }; shift; done
+  while [ ! -f '${marker}' ]; do sleep .01; done
+  echo 'OK surface:909 12345678-1234-1234-1234-123456789abc'
+elif [ "$1" = close-surface ]; then kill -KILL "$(cat '${wpid}')" 2>/dev/null; fi
+exit 0
+`, { mode: 0o755 });
+  process.env.PI_CMUX_BIN = fk;
+  const ac = new AbortController();
+  const poll = setInterval(() => existsSync(marker) && ac.abort(), 10);
+  const res = await runCmuxRace("abort in launch window", [`echo $$ > '${child}'; sleep 37.9`], undefined, 10, dir, ac.signal);
+  clearInterval(poll);
+  process.env.PI_CMUX_BIN = fake;
+  assert.match(res.error ?? "", /cancelled/, "cancellation is a result, not a throw");
+  assert.ok(Array.isArray(res.cleanupWarnings));
+  await new Promise((r) => setTimeout(r, 3500)); // let the paused leader wake and see the marker
+  assert.ok(!existsSync(child), "the runner command must never start after teardown");
+  assert.equal(pg("sleep 37.9"), "");
+  console.log("✓ launch window: teardown before the group is recorded leaves nothing running; cancel returns a result");
+}
+
+// Escaped verifier: reported, and its worktree is kept rather than deleted under it
+{
+  const pidf = join(tmp, "verify-escapee.pid");
+  const res = await runCmuxRace("verify escape", ["true"], `python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(21.9)' '${pidf}' & true`, 5, repo);
+  const pid = Number(readFileSync(pidf, "utf8"));
+  try { process.kill(pid, "SIGKILL"); } catch {}
+  assert.ok(res.cleanupWarnings.some((w) => /verify process left its process group/.test(w)), JSON.stringify(res.cleanupWarnings));
+  const kept = g("worktree", "list").split("\n");
+  assert.equal(kept.length, 2, "the escaped verifier's worktree is kept");
+  g("worktree", "remove", "--force", kept[1].split(/\s+/)[0]);
+  console.log("✓ escaped verifier: warned, worktree kept");
+}
+
+// A runner that reads stdin gets EOF (non-interactive) instead of stalling the race
+{
+  const res = await runCmuxRace("stdin reader", ["cat > /dev/null; true"], undefined, 10, plain);
+  assert.equal(res.winner?.name, "runner-1", res.error);
+  console.log("✓ stdin-reading runner finishes (stdin is /dev/null)");
+}
+
+// killGroup never signals a group whose id now belongs to an unrelated process
+{
+  const stranger = spawn("sleep", ["41.3"], { detached: true, stdio: "ignore" });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(await killGroup(stranger.pid!, "/not/our/race/dir"), "foreign");
+  assert.doesNotThrow(() => process.kill(stranger.pid!, 0), "stranger must still be alive");
+  process.kill(stranger.pid!, "SIGKILL");
+  console.log("✓ killGroup refuses a group it does not own");
+}
 
 console.log("\nRACE E2E PASSED");

@@ -67,6 +67,7 @@ export interface RaceRunnerConfig {
 
 
 export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean }
+const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
 // Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
 // KILL after 2 s), so descendants can't outlive it and a timed-out command can never count as a pass.
@@ -91,7 +92,13 @@ export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; sig
     child.stderr!.on("data", add);
     let timedOut = false, aborted = false, escaped = false, done = false;
     let killTimer: NodeJS.Timeout | undefined, settleTimer: NodeJS.Timeout | undefined;
-    const group = (sig: NodeJS.Signals) => { try { process.kill(-child.pid!, sig); } catch {} };
+    // A PGID is only reused once its group is empty, and the new group's leader has pid == pgid. So once
+    // our leader has been reaped, a live process with that pid means the id is someone else's: hands off.
+    const group = (sig: NodeJS.Signals) => {
+      const reaped = child.exitCode !== null || child.signalCode !== null;
+      if (reaped && pidAlive(child.pid!)) return;
+      try { process.kill(-child.pid!, sig); } catch {}
+    };
     const finish = (code: number | null) => {
       if (done) return;
       done = true;
@@ -123,17 +130,27 @@ export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; sig
 
 const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
-// Each runner's command runs as its own process group (wrapper uses `set -m`), recorded at launch.
-// Killing the group reaches backgrounded descendants even after the wrapper itself has exited.
-// ponytail: no identity check before signalling, so a recycled PGID in the seconds-long window
-// between launch and teardown could be hit; upgrade path is a start-time check via ps.
-async function killGroup(pgid: number): Promise<boolean> {
-  if (!groupAlive(pgid)) return true;
-  try { process.kill(-pgid, "SIGTERM"); } catch {}
-  for (let i = 0; i < 10 && groupAlive(pgid); i++) await new Promise((r) => setTimeout(r, 100));
-  if (groupAlive(pgid)) try { process.kill(-pgid, "SIGKILL"); } catch {}
-  for (let i = 0; i < 5 && groupAlive(pgid); i++) await new Promise((r) => setTimeout(r, 100));
-  return !groupAlive(pgid);
+// Each runner's job leader is `bash -c <script> race-leader <race dir>/<runner>.pgid ...`: it records its
+// own pid (= its process group) before running anything and never execs, so its argv identifies it.
+// Owned = the leader is still ours (argv carries our race dir, or it's a zombie awaiting reaping), or the
+// leader is gone, in which case the id cannot have been reused while members remain.
+// ponytail: a recycled group whose own leader also exited would pass; that needs two PID wraps in one race.
+function ownsGroup(pgid: number, marker: string): boolean {
+  if (!pidAlive(pgid)) return true;
+  let ps = "";
+  try { ps = execFileSync("ps", ["-o", "stat=,command=", "-p", String(pgid)], { encoding: "utf8" }); } catch {}
+  return ps.trimStart().startsWith("Z") || ps.includes(marker);
+}
+
+export async function killGroup(pgid: number, marker: string): Promise<"gone" | "killed" | "survived" | "foreign"> {
+  if (!groupAlive(pgid)) return "gone";
+  for (const [sig, polls] of [["SIGTERM", 10], ["SIGKILL", 5]] as const) {
+    if (!groupAlive(pgid)) break;
+    if (!ownsGroup(pgid, marker)) return "foreign";
+    try { process.kill(-pgid, sig); } catch {}
+    for (let i = 0; i < polls && groupAlive(pgid); i++) await new Promise((r) => setTimeout(r, 100));
+  }
+  return groupAlive(pgid) ? "survived" : "killed";
 }
 
 function git(args: string[], cwd: string): string | null {
@@ -192,11 +209,21 @@ export async function runCmuxRace(
   const worktreeBase = repoRoot ? mkdtempSync(join(os.tmpdir(), "pi-cmux-race-wt-")) : null;
   const createdWorktrees: string[] = [];
   const cleanupWarnings: string[] = [];
+  const keptWorktrees = new Set<string>(); // processes may still run there: never delete
+  const cancelFile = join(raceDir, "cancel");
   let winner: RaceRunnerConfig | null = null;
+  // Cancellation is a result, not a throw, so teardown warnings still reach the caller
+  const cancelled = (when: string): RaceExecutionResult => ({
+    totalRunners: runners.length,
+    durationMs: Date.now() - startTime,
+    isolated: createdWorktrees.length > 0,
+    cleanupWarnings,
+    error: `Race cancelled ${when}.`,
+  });
 
   try {
     if (signal?.aborted) {
-      throw new Error("Race aborted prior to split creation");
+      return cancelled("before any runner started");
     }
 
     // 0. Inside a git repo, every runner MUST get its own worktree; never fall back to the caller's
@@ -224,7 +251,7 @@ export async function runCmuxRace(
     // 2. Spawn runner splits atomically
     for (let i = 0; i < runners.length; i++) {
       if (signal?.aborted) {
-        throw new Error("Race aborted during runner launch");
+        return cancelled("while launching runners");
       }
 
       const r = runners[i];
@@ -241,12 +268,15 @@ export async function runCmuxRace(
       // syntax (unbalanced parens, heredocs) cannot break the wrapper.
       writeFileSync(cmdFile, r.command + "\n", { mode: 0o600 });
       const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
-      // set -m: the background job gets its own process group (pgid = its pid), which teardown kills.
+      // set -m: the job gets its own process group (pgid = its pid). Its leader writes that id BEFORE
+      // running anything and refuses to start once teardown has begun (cancel marker), so there is no
+      // window where a runner executes unowned. "; exit $?" stops bash exec-ing the command over the
+      // leader, keeping its argv (our race dir) as identity. Runners are non-interactive: stdin is
+      // /dev/null, so a command that reads input gets EOF instead of being stopped by SIGTTIN.
       const scriptContent = `#!/bin/bash
 set -m
 cd ${q(r.workdir)} || { echo 1 > ${q(exitFile)}; touch ${q(doneFile)}; exit 1; }
-bash ${q(cmdFile)} > ${q(logFile)} 2>&1 &
-echo $! > ${q(pgidFile)}
+bash -c 'echo $$ > "$1" || exit 125; [ -e "$2" ] && exit 125; bash "$3"; exit $?' race-leader ${q(pgidFile)} ${q(cancelFile)} ${q(cmdFile)} > ${q(logFile)} 2>&1 < /dev/null &
 wait $!
 echo $? > ${q(exitFile)}
 touch ${q(doneFile)}
@@ -281,7 +311,7 @@ touch ${q(doneFile)}
 
     while (Date.now() < deadline) {
       if (signal?.aborted) {
-        throw new Error("Race aborted by caller");
+        return cancelled("by the caller");
       }
 
       const completedRunners: RaceRunnerConfig[] = [];
@@ -316,6 +346,10 @@ touch ${q(doneFile)}
           // async (Pi stays responsive), bounded by the race deadline, whole process group killed on expiry
           const v = await runBounded(verifyCmd, { cwd: candidate.workdir!, timeoutMs: Math.min(60000, remaining), signal });
           verifyPass = v.code === 0 && !v.timedOut && !v.aborted;
+          if (v.escaped) {
+            if (candidate.worktreeRoot) keptWorktrees.add(candidate.worktreeRoot);
+            cleanupWarnings.push(`${candidate.name}: a verify process left its process group and may still be running in ${candidate.worktreeRoot ?? candidate.workdir}${candidate.worktreeRoot ? "; that worktree was kept" : ""}`);
+          }
         }
         if (verifyPass && Date.now() <= deadline) {
           winner = candidate;
@@ -403,12 +437,18 @@ touch ${q(doneFile)}
   } finally {
     // 1. Kill every runner's process group FIRST (finished runners too: their background children
     //    may still be running). Pane closure is not process ownership and is not relied on.
-    const survivors = new Set<string>();
+    // The cancel marker goes down BEFORE reading the ids: a leader writes its id and then checks the
+    // marker, so either we read its id here or it sees the marker and never runs the command.
+    try { writeFileSync(cancelFile, ""); } catch {}
     for (const r of runners) {
       const pgid = Number(readFileSafe(join(raceDir, `${r.name}.pgid`)));
-      if (pgid > 1 && !(await killGroup(pgid))) {
-        survivors.add(r.name);
-        cleanupWarnings.push(`${r.name} (process group ${pgid}) survived SIGKILL; its worktree was kept`);
+      if (!(pgid > 1)) continue;
+      const outcome = await killGroup(pgid, raceDir);
+      if (outcome === "survived" || outcome === "foreign") {
+        if (r.worktreeRoot) keptWorktrees.add(r.worktreeRoot);
+        cleanupWarnings.push(outcome === "survived"
+          ? `${r.name}: process group ${pgid} survived SIGKILL${r.worktreeRoot ? "; its worktree was kept" : ""}`
+          : `${r.name}: process group id ${pgid} now belongs to an unrelated process, so it was not signalled${r.worktreeRoot ? "; its worktree was kept" : ""}`);
       }
     }
     // 2. Then close the panes
@@ -419,11 +459,10 @@ touch ${q(doneFile)}
     // Remove every worktree except the winner's (kept so its changes can be inspected/merged)
     const keep = winner?.worktreeRoot ?? null;
     for (const wt of createdWorktrees) {
-      const owner = runners.find((r) => r.worktreeRoot === wt);
-      if (wt !== keep && !(owner && survivors.has(owner.name))) git(["worktree", "remove", "--force", wt], repoRoot!);
+      if (wt !== keep && !keptWorktrees.has(wt)) git(["worktree", "remove", "--force", wt], repoRoot!);
     }
     if (repoRoot) git(["worktree", "prune"], repoRoot);
-    if (worktreeBase && !keep && survivors.size === 0) {
+    if (worktreeBase && !keep && keptWorktrees.size === 0) {
       try {
         rmSync(worktreeBase, { recursive: true, force: true });
       } catch {}

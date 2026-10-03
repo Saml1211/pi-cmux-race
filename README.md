@@ -28,9 +28,13 @@ The winner's worktree root is kept and reported, so you can inspect or merge it.
 
 Each finished runner is verified at most once. Verification runs asynchronously in its own process group, capped by the race deadline. On expiry or abort the whole group gets SIGTERM, then SIGKILL after 2 s. A timed-out verify never counts as a pass.
 
-Each runner command runs in its own process group (the wrapper uses `set -m`), recorded at launch. Teardown kills every runner's group first, including runners that finished but left background children. Only then does it close panes and remove worktrees. A group that survives SIGKILL keeps its worktree, and it is reported in `cleanupWarnings` on every result, including errors.
+Each runner command runs in its own process group (the wrapper uses `set -m`). The group's leader records its id *before* running anything, and it refuses to start once teardown has begun. Teardown drops that cancel marker first, so a runner can never execute unowned, even if teardown lands mid-launch.
 
-If a verify descendant escapes the group with `setsid` and holds the output pipes, the call still settles 5 s after the first kill signal and reports `escaped`. Output is capped by bytes (10 MB).
+Teardown kills every runner's group first, including runners that finished but left background children. Only then does it close panes and remove worktrees. It only signals a group it still owns: the leader's argv carries the race directory, and a process-group ID that has been recycled is left alone. A group that survives SIGKILL, or whose ID now belongs to someone else, keeps its worktree. Both cases are reported in `cleanupWarnings` on every result, including errors and cancellation. Cancellation returns a result; it does not throw.
+
+Runners are non-interactive: stdin is `/dev/null`, so a command that reads input gets EOF instead of stalling.
+
+If a verify descendant escapes the group with `setsid` and holds the output pipes, the call still settles 5 s after the first kill signal. A warning names the runner, and that worktree is kept rather than deleted under the escaped process. Output is capped by bytes (10 MB).
 
 ## Verification
 
