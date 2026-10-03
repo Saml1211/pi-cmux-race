@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCmuxRace } from "./index.ts";
+import { runCmuxRace, runBounded } from "./index.ts";
 
 delete process.env.TYPESAFE_API_KEY;
 const tmp = realpathSync(mkdtempSync(join(tmpdir(), "race-e2e-")));
@@ -55,6 +55,7 @@ g("worktree", "remove", "--force", r.winner!.worktree!);
 // Timeout: nothing finishes -> error, all worktrees removed
 const t = await runCmuxRace("never", ["sleep 30", "sleep 30"], undefined, 5, repo);
 assert.match(t.error ?? "", /timed out/);
+assert.ok(Array.isArray(t.cleanupWarnings), "cleanupWarnings present on error results");
 assert.equal(g("worktree", "list").split("\n").length, 1, "timeout must remove every worktree");
 console.log("✓ timeout: error reported, every worktree removed");
 
@@ -105,5 +106,32 @@ execFileSync("mkdir", ["-p", empty]); g2(empty, "init", "-q");
 const e = await runCmuxRace("no commits", ["true", "true"], undefined, 10, empty);
 assert.match(e.error ?? "", /no commits/);
 console.log("✓ fail closed: worktree failure and commitless repo refuse to run (no panes, checkout untouched)");
+
+// A runner that FINISHED but left a background child: the child must still die at teardown
+const bg = await runCmuxRace("bg child", ["sleep 33.3 & true", "sleep 20"], undefined, 10, repo);
+assert.equal(bg.winner?.name, "runner-1");
+await new Promise((r) => setTimeout(r, 300));
+assert.equal(pg("sleep 33.3"), "", "finished runner's background child must be killed (process group)");
+assert.equal(pg("sleep 20"), "", "losing runner killed");
+assert.ok(Array.isArray(bg.cleanupWarnings) && bg.cleanupWarnings.length === 0);
+if (bg.winner?.worktree) g2(repo, "worktree", "remove", "--force", bg.winner.worktree);
+console.log("✓ finished runner's background child killed via its process group");
+
+// runBounded: a setsid escapee holding our pipes must not hang the call (settles, reports escaped)
+const t1 = Date.now();
+const esc = await runBounded("python3 -c 'import os,time; os.setsid(); time.sleep(7.7)' & true", { cwd: tmp, timeoutMs: 200 });
+const took = Date.now() - t1;
+try { execFileSync("pkill", ["-f", "time.sleep\\(7.7\\)"]); } catch {}
+assert.ok(took < 6500, `runBounded hung for ${took} ms`);
+assert.equal(esc.timedOut, true);
+assert.equal(esc.escaped, true, "escape is reported");
+console.log(`✓ setsid escapee: runBounded settled in ${took} ms, timedOut + escaped reported`);
+
+// runBounded: byte cap is bytes, not characters
+const cap = await runBounded("printf 'é%.0s' $(seq 1 200)", { cwd: tmp, timeoutMs: 5000, maxBytes: 16 });
+const body = cap.out.replace(/\n… \(output truncated\)$/, "");
+assert.ok(Buffer.byteLength(body) <= 16 + 3, `cap exceeded: ${Buffer.byteLength(body)} bytes`); // +3: one replacement char at a cut
+assert.match(cap.out, /output truncated/);
+console.log("✓ output cap counts bytes and marks truncation");
 
 console.log("\nRACE E2E PASSED");

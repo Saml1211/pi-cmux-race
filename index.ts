@@ -66,55 +66,74 @@ export interface RaceRunnerConfig {
 }
 
 
-export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean }
+export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean }
 
 // Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
 // KILL after 2 s), so descendants can't outlive it and a timed-out command can never count as a pass.
-// ponytail: duplicated in pi-adw (separate repos); a process that calls setsid escapes the group.
+// A descendant that left the group (setsid) and holds our pipes would block 'close' forever, so the
+// call also settles 5 s after the first kill signal no matter what, closing its pipes and reporting escaped: true.
+// ponytail: duplicated in pi-adw (separate repos); setsid escapees are reported, not hunted down.
 export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxBytes?: number }): Promise<BoundedResult> {
   return new Promise((resolve) => {
     const child = spawn("bash", ["-c", cmd], { cwd: o.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     const max = o.maxBytes ?? 10 * 1024 * 1024;
-    let out = "";
-    const add = (b: Buffer) => { if (out.length < max) out += b.toString(); };
+    const chunks: Buffer[] = [];
+    let bytes = 0, truncated = false;
+    const add = (b: Buffer) => {
+      const room = max - bytes;
+      if (room <= 0) { truncated = true; return; }
+      const part = b.length > room ? b.subarray(0, room) : b;
+      if (part.length < b.length) truncated = true;
+      chunks.push(part);
+      bytes += part.length;
+    };
     child.stdout!.on("data", add);
     child.stderr!.on("data", add);
-    let timedOut = false, aborted = false, killTimer: NodeJS.Timeout | undefined;
+    let timedOut = false, aborted = false, escaped = false, done = false;
+    let killTimer: NodeJS.Timeout | undefined, settleTimer: NodeJS.Timeout | undefined;
     const group = (sig: NodeJS.Signals) => { try { process.kill(-child.pid!, sig); } catch {} };
-    const stop = () => { group("SIGTERM"); killTimer ??= setTimeout(() => group("SIGKILL"), 2000); };
+    const finish = (code: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
+      clearTimeout(settleTimer);
+      o.signal?.removeEventListener("abort", onAbort);
+      const out = Buffer.concat(chunks).toString("utf8") + (truncated ? "\n… (output truncated)" : "");
+      resolve({ code, out, timedOut, aborted, escaped });
+    };
+    const stop = () => {
+      group("SIGTERM");
+      killTimer ??= setTimeout(() => group("SIGKILL"), 2000);
+      settleTimer ??= setTimeout(() => {
+        escaped = true;
+        child.stdout!.destroy();
+        child.stderr!.destroy();
+        finish(child.exitCode);
+      }, 5000);
+    };
     const timer = setTimeout(() => { timedOut = true; stop(); }, Math.max(1, o.timeoutMs));
     const onAbort = () => { aborted = true; stop(); };
     if (o.signal?.aborted) onAbort();
     else o.signal?.addEventListener("abort", onAbort, { once: true });
-    child.on("error", (e) => { out += String(e); });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
-      o.signal?.removeEventListener("abort", onAbort);
-      resolve({ code, out, timedOut, aborted });
-    });
+    child.on("error", (e) => { chunks.push(Buffer.from(String(e))); });
+    child.on("close", (code) => finish(code));
   });
 }
 
-function descendants(pid: number): number[] {
-  let kids: number[] = [];
-  try {
-    kids = execFileSync("pgrep", ["-P", String(pid)], { encoding: "utf8" }).split("\n").filter(Boolean).map(Number);
-  } catch {}
-  return kids.flatMap((k) => [k, ...descendants(k)]);
-}
+const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
-const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-
-// Runner panes are spawned by cmux, not us, so there is no process group we own: walk the tree.
-// ponytail: pid reuse between the pidfile write and teardown is not guarded (seconds-long window).
-async function killTree(pid: number): Promise<boolean> {
-  const all = [pid, ...descendants(pid)];
-  for (const p of all) try { process.kill(p, "SIGTERM"); } catch {}
-  await new Promise((r) => setTimeout(r, 1000));
-  for (const p of all.filter(alive)) try { process.kill(p, "SIGKILL"); } catch {}
-  await new Promise((r) => setTimeout(r, 200));
-  return !all.some(alive);
+// Each runner's command runs as its own process group (wrapper uses `set -m`), recorded at launch.
+// Killing the group reaches backgrounded descendants even after the wrapper itself has exited.
+// ponytail: no identity check before signalling, so a recycled PGID in the seconds-long window
+// between launch and teardown could be hit; upgrade path is a start-time check via ps.
+async function killGroup(pgid: number): Promise<boolean> {
+  if (!groupAlive(pgid)) return true;
+  try { process.kill(-pgid, "SIGTERM"); } catch {}
+  for (let i = 0; i < 10 && groupAlive(pgid); i++) await new Promise((r) => setTimeout(r, 100));
+  if (groupAlive(pgid)) try { process.kill(-pgid, "SIGKILL"); } catch {}
+  for (let i = 0; i < 5 && groupAlive(pgid); i++) await new Promise((r) => setTimeout(r, 100));
+  return !groupAlive(pgid);
 }
 
 function git(args: string[], cwd: string): string | null {
@@ -137,7 +156,7 @@ export interface RaceExecutionResult {
   totalRunners: number;
   durationMs: number;
   isolated: boolean;
-  cleanupWarnings?: string[];
+  cleanupWarnings: string[];
   error?: string;
 }
 
@@ -184,12 +203,12 @@ export async function runCmuxRace(
     // checkout (a runner would then edit it while the result claimed isolation).
     if (repoRoot && worktreeBase) {
       if (git(["rev-parse", "--verify", "-q", "HEAD"], repoRoot) === null) {
-        return { totalRunners: runners.length, durationMs: 0, isolated: false, error: "Repository has no commits, so runners cannot be isolated in worktrees. Commit first, or run outside the repo." };
+        return { totalRunners: runners.length, durationMs: 0, isolated: false, cleanupWarnings, error: "Repository has no commits, so runners cannot be isolated in worktrees. Commit first, or run outside the repo." };
       }
       for (const r of runners) {
         const wt = join(worktreeBase, r.name);
         if (git(["worktree", "add", "--detach", wt, "HEAD"], repoRoot) === null) {
-          return { totalRunners: runners.length, durationMs: 0, isolated: false, error: `Could not create an isolated worktree for ${r.name}; refusing to run in your checkout.` };
+          return { totalRunners: runners.length, durationMs: 0, isolated: false, cleanupWarnings, error: `Could not create an isolated worktree for ${r.name}; refusing to run in your checkout.` };
         }
         createdWorktrees.push(wt);
         r.worktreeRoot = wt;
@@ -216,16 +235,19 @@ export async function runCmuxRace(
       const cmdFile = join(raceDir, `${r.name}.cmd.sh`);
 
       r.workdir ??= cwd; // only outside git (worktrees were created above, fail-closed)
-      const pidFile = join(raceDir, `${r.name}.pid`);
+      const pgidFile = join(raceDir, `${r.name}.pgid`);
 
       // The runner command is a shell command by design; it lives in its own file so its
       // syntax (unbalanced parens, heredocs) cannot break the wrapper.
       writeFileSync(cmdFile, r.command + "\n", { mode: 0o600 });
       const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
+      // set -m: the background job gets its own process group (pgid = its pid), which teardown kills.
       const scriptContent = `#!/bin/bash
-echo $$ > ${q(pidFile)}
+set -m
 cd ${q(r.workdir)} || { echo 1 > ${q(exitFile)}; touch ${q(doneFile)}; exit 1; }
-bash ${q(cmdFile)} > ${q(logFile)} 2>&1
+bash ${q(cmdFile)} > ${q(logFile)} 2>&1 &
+echo $! > ${q(pgidFile)}
+wait $!
 echo $? > ${q(exitFile)}
 touch ${q(doneFile)}
 `;
@@ -318,6 +340,7 @@ touch ${q(doneFile)}
         totalRunners: runners.length,
         durationMs,
         isolated: createdWorktrees.length > 0,
+        cleanupWarnings,
         error: `Race timed out after ${timeoutSeconds}s without a verified winner.`,
       };
     }
@@ -375,28 +398,32 @@ touch ${q(doneFile)}
       totalRunners: runners.length,
       durationMs,
       isolated: createdWorktrees.length > 0,
-      cleanupWarnings: cleanupWarnings.length ? cleanupWarnings : undefined,
+      cleanupWarnings, // same array: entries added during teardown (finally) reach the caller
     };
   } finally {
-    // Unconditional runner teardown: close all created surfaces so no orphaned panes remain
+    // 1. Kill every runner's process group FIRST (finished runners too: their background children
+    //    may still be running). Pane closure is not process ownership and is not relied on.
+    const survivors = new Set<string>();
+    for (const r of runners) {
+      const pgid = Number(readFileSafe(join(raceDir, `${r.name}.pgid`)));
+      if (pgid > 1 && !(await killGroup(pgid))) {
+        survivors.add(r.name);
+        cleanupWarnings.push(`${r.name} (process group ${pgid}) survived SIGKILL; its worktree was kept`);
+      }
+    }
+    // 2. Then close the panes
     for (const surface of createdSurfaces) {
       safeCmux(["close-surface", "--surface", surface]);
-    }
-    // Pane closure alone is not process ownership (close-surface can fail): kill every runner that
-    // never finished, and say so if one survives.
-    for (const r of runners) {
-      if (existsSync(join(raceDir, `${r.name}.done`))) continue;
-      const pid = Number(readFileSafe(join(raceDir, `${r.name}.pid`)));
-      if (pid > 1 && !(await killTree(pid))) cleanupWarnings.push(`${r.name} (pid ${pid}) survived SIGKILL`);
     }
 
     // Remove every worktree except the winner's (kept so its changes can be inspected/merged)
     const keep = winner?.worktreeRoot ?? null;
     for (const wt of createdWorktrees) {
-      if (wt !== keep) git(["worktree", "remove", "--force", wt], repoRoot!);
+      const owner = runners.find((r) => r.worktreeRoot === wt);
+      if (wt !== keep && !(owner && survivors.has(owner.name))) git(["worktree", "remove", "--force", wt], repoRoot!);
     }
     if (repoRoot) git(["worktree", "prune"], repoRoot);
-    if (worktreeBase && !keep) {
+    if (worktreeBase && !keep && survivors.size === 0) {
       try {
         rmSync(worktreeBase, { recursive: true, force: true });
       } catch {}
@@ -458,15 +485,16 @@ export default function (pi: ExtensionAPI) {
         effectiveSignal,
       );
 
+      const warn = result.cleanupWarnings.length ? `\n⚠️ Cleanup: ${result.cleanupWarnings.join("; ")}` : "";
       if (result.error) {
         return {
-          content: [{ type: "text", text: `[cmux_race failure]: ${result.error}` }],
+          content: [{ type: "text", text: `[cmux_race failure]: ${result.error}${warn}` }],
         };
       }
 
       const win = result.winner!;
       const jevReport = win.jevEvaluation ? ` (${win.jevEvaluation})` : "";
-      const text = `🏆 [cmux_race WINNER]: '${win.name}' completed in ${(win.durationMs / 1000).toFixed(1)}s${jevReport}!\nCommand: \`${win.command}\`\n\nExecution Log:\n\`\`\`\n${win.log}\n\`\`\`\n\nRedundant runner panes were closed.${result.cleanupWarnings ? `\n⚠️ Cleanup: ${result.cleanupWarnings.join("; ")}` : ""}${win.worktree ? `\nWinner's changes are in worktree: ${win.worktree} (inspect, then merge or \`git worktree remove\` it).` : result.isolated ? "" : "\nRunners shared the working directory (not a git repo), so they were not isolated."}`;
+      const text = `🏆 [cmux_race WINNER]: '${win.name}' completed in ${(win.durationMs / 1000).toFixed(1)}s${jevReport}!\nCommand: \`${win.command}\`\n\nExecution Log:\n\`\`\`\n${win.log}\n\`\`\`\n\nRedundant runner panes were closed.${warn}${win.worktree ? `\nWinner's changes are in worktree: ${win.worktree} (inspect, then merge or \`git worktree remove\` it).` : result.isolated ? "" : "\nRunners shared the working directory (not a git repo), so they were not isolated."}`;
 
       return {
         content: [{ type: "text", text }],
