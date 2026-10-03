@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdtempSync, statSync, realpathSync } from "node:fs";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import os from "node:os";
 import type {
   ExtensionAPI,
@@ -67,6 +67,7 @@ export interface RaceRunnerConfig {
 
 
 export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean; strays: boolean }
+const win = process.platform === "win32";
 const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
 // Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
@@ -75,10 +76,23 @@ const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } c
 // call also settles 5 s after the first kill signal no matter what, closing its pipes and reporting escaped: true.
 // A command that exits normally but leaves background processes in its group (pipes closed, so 'close'
 // still fires) has them killed too, reported as strays: true.
+// On native Windows there are no process groups: bash is Pi's configured shell (never WSL's bash.exe), the
+// tree is killed with `taskkill /F /T` for both stages, and strays are not detected.
+// ponytail: taskkill /T cannot reach processes that left the tree (Pi issue #9129); the 5 s settle still bounds the call.
 // ponytail: duplicated in pi-adw (separate repos); setsid escapees are reported, not hunted down.
-export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxBytes?: number }): Promise<BoundedResult> {
+async function winShell(): Promise<string> {
+  const pi: any = await import("@earendil-works/pi-coding-agent");
+  let shellPath: string | undefined;
+  try { shellPath = JSON.parse(readFileSync(join(pi.getAgentDir(), "settings.json"), "utf8")).shellPath; } catch {}
+  const sh = pi.getShellConfig(shellPath);
+  if (sh.commandTransport === "stdin") throw new Error("only WSL bash found; install Git for Windows or set shellPath in Pi settings.json");
+  return sh.shell;
+}
+export async function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxBytes?: number }): Promise<BoundedResult> {
+  let shell = "bash";
+  if (win) try { shell = await winShell(); } catch (e: any) { return { code: null, out: `runBounded: ${e?.message ?? e}`, timedOut: false, aborted: false, escaped: false, strays: false }; }
   return new Promise((resolve) => {
-    const child = spawn("bash", ["-c", cmd], { cwd: o.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(shell, ["-c", cmd], { cwd: o.cwd, detached: !win, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     const max = o.maxBytes ?? 10 * 1024 * 1024;
     const chunks: Buffer[] = [];
     let bytes = 0, truncated = false;
@@ -98,6 +112,7 @@ export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; sig
     // our leader has been reaped, a live process with that pid means the id is someone else's: hands off.
     const group = (sig: NodeJS.Signals) => {
       const reaped = child.exitCode !== null || child.signalCode !== null;
+      if (win) { if (!reaped) execFile(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true }, () => {}); return; }
       if (reaped && pidAlive(child.pid!)) return;
       try { process.kill(-child.pid!, sig); } catch {}
     };
@@ -108,7 +123,7 @@ export function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; sig
       clearTimeout(settleTimer);
       o.signal?.removeEventListener("abort", onAbort);
       // Members left in the group: the id cannot be reused while they live, so it is still ours.
-      const strays = !killTimer && groupAlive(child.pid!);
+      const strays = !win && !killTimer && groupAlive(child.pid!);
       if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
       const out = Buffer.concat(chunks).toString("utf8") + (truncated ? "\n… (output truncated)" : "");
       const result = { code, out, timedOut, aborted, escaped, strays };

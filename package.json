@@ -1,6 +1,6 @@
 {
   "name": "pi-cmux-race",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Atomic parallel competitive runner orchestration in cmux for Pi Coding Agent",
   "main": "index.ts",
   "scripts": {
@@ -13,7 +13,8 @@
     "race-and-notify",
     "parallel",
     "orchestration",
-    "indydevdan"
+    "indydevdan",
+    "pi-package"
   ],
   "author": "Sam Lyndon",
   "license": "MIT",
@@ -21,5 +22,10 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }

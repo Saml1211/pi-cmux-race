@@ -42,3 +42,5 @@ If the verify command exits but leaves background processes in its group, they a
 bun run test.ts       # unit
 bun run race.e2e.ts   # real race loop + real git worktrees, fake cmux via PI_CMUX_BIN (no panes opened)
 ```
+
+**Windows:** `runBounded` runs verify commands in Pi's configured bash (settings.json `shellPath`, else Git Bash; WSL's `bash.exe` is refused with a clear error), kills the process tree with `taskkill /F /T`, and does not detect stray background processes.
