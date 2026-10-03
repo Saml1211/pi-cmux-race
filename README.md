@@ -15,8 +15,15 @@ When facing hard bugs, stubborn test failures, or exploratory refactors, a singl
 4. **Automated Teardown**: Immediately tears down the losing/redundant splits (`close-surface`) to free CPU/RAM and keep the workspace tidy.
 5. **TypeSafe Jev Validation**: Rapid quality evaluation of the winning solution.
 
+## Isolation and verification
+
+When the working directory is inside a git repo, each runner gets its own detached worktree at `HEAD`, so runners can't overwrite each other and `verifyCommand` checks the candidate it is judging. **Uncommitted changes are not carried into the worktrees.** The winner's worktree is kept and its path reported, so you can inspect or merge it. Losers' worktrees are removed. Outside a git repo, runners share the directory and the result says so.
+
+Each finished runner is verified at most once. Verification runs asynchronously and is capped by the race deadline, so a winner verified after the deadline is never accepted. Each runner command is written to its own script file, so its syntax can't break the wrapper.
+
 ## Verification
 
 ```bash
-node --input-type=module test.ts
+bun run test.ts       # unit
+bun run race.e2e.ts   # real race loop + real git worktrees, fake cmux via PI_CMUX_BIN (no panes opened)
 ```

@@ -1,7 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdtempSync, statSync } from "node:fs";
-import { execFileSync, execSync } from "node:child_process";
+import { exec, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import os from "node:os";
 import type {
   ExtensionAPI,
@@ -12,6 +13,7 @@ import { Type } from "@sinclair/typebox";
 // ponytail: native cmux CLI wrapper; argv-based execution immune to shell injection
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODEL = "jev-latest";
+const execAsync = promisify(exec);
 
 function isCmuxActive(): boolean {
   return Boolean(
@@ -23,7 +25,8 @@ function isCmuxActive(): boolean {
 
 export function safeCmux(args: string[]): string {
   try {
-    return execFileSync("cmux", args, {
+    // PI_CMUX_BIN lets tests substitute a fake cmux instead of opening real panes
+    return execFileSync(process.env.PI_CMUX_BIN || "cmux", args, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 3000,
@@ -59,6 +62,16 @@ export interface RaceRunnerConfig {
   surfaceId?: string;
   surfaceRef?: string;
   completedAt?: number;
+  workdir?: string; // isolated git worktree, or the shared cwd when not a git repo
+  verifyFailed?: boolean; // verified once and failed; never re-verify
+}
+
+function git(args: string[], cwd: string): string | null {
+  try {
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 15000 }).trim();
+  } catch {
+    return null;
+  }
 }
 
 export interface RaceExecutionResult {
@@ -68,9 +81,11 @@ export interface RaceExecutionResult {
     durationMs: number;
     log: string;
     jevEvaluation?: string;
+    worktree?: string; // kept for inspection/merge when runners were isolated
   };
   totalRunners: number;
   durationMs: number;
+  isolated: boolean;
   error?: string;
 }
 
@@ -95,6 +110,13 @@ export async function runCmuxRace(
   const deadline = startTime + maxMs;
 
   const createdSurfaces: string[] = [];
+  // Each runner gets its own detached worktree at HEAD, so runners cannot clobber each other and
+  // verifyCmd tests the candidate it is judging. Uncommitted changes in cwd are NOT carried over.
+  const repoRoot = git(["rev-parse", "--show-toplevel"], cwd);
+  const repoPrefix = git(["rev-parse", "--show-prefix"], cwd) ?? "";
+  const worktreeBase = repoRoot ? mkdtempSync(join(os.tmpdir(), "pi-cmux-race-wt-")) : null;
+  const createdWorktrees: string[] = [];
+  let winner: RaceRunnerConfig | null = null;
 
   try {
     if (signal?.aborted) {
@@ -116,23 +138,36 @@ export async function runCmuxRace(
       const exitFile = join(raceDir, `${r.name}.exit`);
       const doneFile = join(raceDir, `${r.name}.done`);
       const scriptFile = join(raceDir, `${r.name}.sh`);
+      const cmdFile = join(raceDir, `${r.name}.cmd.sh`);
 
-      // Wrapper script with safe directory check
-      const escapedCwd = cwd.replace(/(["$`\\])/g, "\\$1");
+      r.workdir = cwd;
+      if (repoRoot && worktreeBase) {
+        const wt = join(worktreeBase, r.name);
+        if (git(["worktree", "add", "--detach", wt, "HEAD"], repoRoot) !== null) {
+          createdWorktrees.push(wt);
+          // same position inside the repo as the caller's cwd (--show-prefix avoids /var vs /private/var mismatches)
+          r.workdir = join(wt, repoPrefix);
+        }
+      }
+
+      // The runner command is a shell command by design; it lives in its own file so its
+      // syntax (unbalanced parens, heredocs) cannot break the wrapper.
+      writeFileSync(cmdFile, r.command + "\n", { mode: 0o600 });
+      const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
       const scriptContent = `#!/bin/bash
-cd "${escapedCwd}" || exit 1
-(${r.command}) > "${logFile}" 2>&1
-echo $? > "${exitFile}"
-touch "${doneFile}"
+cd ${q(r.workdir)} || { echo 1 > ${q(exitFile)}; touch ${q(doneFile)}; exit 1; }
+bash ${q(cmdFile)} > ${q(logFile)} 2>&1
+echo $? > ${q(exitFile)}
+touch ${q(doneFile)}
 `;
-      writeFileSync(scriptFile, scriptContent, { mode: 0o755 });
+      writeFileSync(scriptFile, scriptContent, { mode: 0o700 });
 
       // Atomic split creation
       const out = safeCmux([
         "new-split",
         i === 0 ? "right" : "down",
         "--command",
-        `bash ${scriptFile}`,
+        `bash '${scriptFile.replace(/'/g, `'\\''`)}'`,
         "--focus",
         "false",
         "--id-format",
@@ -151,8 +186,7 @@ touch "${doneFile}"
       }
     }
 
-    // 3. Polling race loop (Wait-for-first-winner with timestamp ordering)
-    let winner: RaceRunnerConfig | null = null;
+    // 3. Polling race loop (first verified finisher wins; each runner is verified at most once)
 
     while (Date.now() < deadline) {
       if (signal?.aborted) {
@@ -174,7 +208,7 @@ touch "${doneFile}"
             }
           }
           const exitCode = readFileSync(exitFile, "utf8").trim();
-          if (exitCode === "0") {
+          if (exitCode === "0" && !r.verifyFailed) {
             completedRunners.push(r);
           }
         }
@@ -184,19 +218,22 @@ touch "${doneFile}"
       completedRunners.sort((a, b) => (a.completedAt || 0) - (b.completedAt || 0));
 
       for (const candidate of completedRunners) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break; // never accept a winner verified after the deadline
         let verifyPass = true;
         if (verifyCmd) {
           try {
-            execSync(verifyCmd, { cwd, stdio: "ignore", timeout: 15000 });
+            // async: a slow verify must not freeze Pi; bounded by the race deadline
+            await execAsync(verifyCmd, { cwd: candidate.workdir, timeout: Math.min(60000, remaining), maxBuffer: 10 * 1024 * 1024, signal });
           } catch {
             verifyPass = false;
           }
         }
-
-        if (verifyPass) {
+        if (verifyPass && Date.now() <= deadline) {
           winner = candidate;
           break;
         }
+        candidate.verifyFailed = true;
       }
 
       if (winner) break;
@@ -214,6 +251,7 @@ touch "${doneFile}"
       return {
         totalRunners: runners.length,
         durationMs,
+        isolated: createdWorktrees.length > 0,
         error: `Race timed out after ${timeoutSeconds}s without a verified winner.`,
       };
     }
@@ -247,6 +285,7 @@ touch "${doneFile}"
           method: "POST",
           headers: { Authorization: `Bearer ${jevApiKey}`, "Content-Type": "application/json" },
           body: JSON.stringify(body),
+          signal: AbortSignal.timeout(5000),
         });
         if (res.ok) {
           const json = (await res.json()) as any;
@@ -265,14 +304,28 @@ touch "${doneFile}"
         durationMs,
         log: logOutput.slice(0, 3000),
         jevEvaluation: jevText || undefined,
+        worktree: createdWorktrees.length ? winner.workdir : undefined,
       },
       totalRunners: runners.length,
       durationMs,
+      isolated: createdWorktrees.length > 0,
     };
   } finally {
     // Unconditional runner teardown: close all created surfaces so no orphaned panes remain
     for (const surface of createdSurfaces) {
       safeCmux(["close-surface", "--surface", surface]);
+    }
+
+    // Remove every worktree except the winner's (kept so its changes can be inspected/merged)
+    const keep = winner && createdWorktrees.length ? join(worktreeBase!, winner.name) : null;
+    for (const wt of createdWorktrees) {
+      if (wt !== keep) git(["worktree", "remove", "--force", wt], repoRoot!);
+    }
+    if (repoRoot) git(["worktree", "prune"], repoRoot);
+    if (worktreeBase && !keep) {
+      try {
+        rmSync(worktreeBase, { recursive: true, force: true });
+      } catch {}
     }
 
     // Always clear cmux status and clean temporary race files
@@ -339,7 +392,7 @@ export default function (pi: ExtensionAPI) {
 
       const win = result.winner!;
       const jevReport = win.jevEvaluation ? ` (${win.jevEvaluation})` : "";
-      const text = `🏆 [cmux_race WINNER]: '${win.name}' completed in ${(win.durationMs / 1000).toFixed(1)}s${jevReport}!\nCommand: \`${win.command}\`\n\nExecution Log:\n\`\`\`\n${win.log}\n\`\`\`\n\nRedundant runner panes were cleanly terminated.`;
+      const text = `🏆 [cmux_race WINNER]: '${win.name}' completed in ${(win.durationMs / 1000).toFixed(1)}s${jevReport}!\nCommand: \`${win.command}\`\n\nExecution Log:\n\`\`\`\n${win.log}\n\`\`\`\n\nRedundant runner panes were closed.${win.worktree ? `\nWinner's changes are in worktree: ${win.worktree} (inspect, then merge or \`git worktree remove\` it).` : result.isolated ? "" : "\nRunners shared the working directory (not a git repo), so they were not isolated."}`;
 
       return {
         content: [{ type: "text", text }],
