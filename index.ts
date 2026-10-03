@@ -1,14 +1,15 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdtempSync, statSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import os from "node:os";
 import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-// ponytail: native cmux CLI wrapper; no external daemon or heavyweight dependencies
+// ponytail: native cmux CLI wrapper; argv-based execution immune to shell injection
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODEL = "jev-latest";
 
@@ -20,9 +21,9 @@ function isCmuxActive(): boolean {
   );
 }
 
-function safeCmux(args: string[]): string {
+export function safeCmux(args: string[]): string {
   try {
-    return execSync(`cmux ${args.join(" ")}`, {
+    return execFileSync("cmux", args, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 3000,
@@ -57,6 +58,7 @@ export interface RaceRunnerConfig {
   command: string;
   surfaceId?: string;
   surfaceRef?: string;
+  completedAt?: number;
 }
 
 export interface RaceExecutionResult {
@@ -80,9 +82,8 @@ export async function runCmuxRace(
   cwd = process.cwd(),
   signal?: AbortSignal,
 ): Promise<RaceExecutionResult> {
-  const raceId = `race-${Date.now()}`;
-  const raceDir = join(cwd, ".scratch", "races", raceId);
-  mkdirSync(raceDir, { recursive: true });
+  // Use unique temporary directory to prevent race collision
+  const raceDir = mkdtempSync(join(os.tmpdir(), "pi-cmux-race-"));
 
   const runners: RaceRunnerConfig[] = runnerCmds.map((cmd, i) => ({
     name: `runner-${i + 1}`,
@@ -90,92 +91,119 @@ export async function runCmuxRace(
   }));
 
   const startTime = Date.now();
+  const maxMs = Math.max(5, timeoutSeconds) * 1000;
+  const deadline = startTime + maxMs;
+
+  const createdSurfaces: string[] = [];
 
   try {
-    // 1. Set cmux visual status
-    safeCmux(["set-status", "race", `"🏃 ${runners.length} racing"`, "--icon", "figure.run", "--color", '"#ff9500"']);
-    safeCmux(["set-progress", "0.1", "--label", `"Race started: ${goal.slice(0, 30)}..."`]);
+    if (signal?.aborted) {
+      throw new Error("Race aborted prior to split creation");
+    }
+
+    // 1. Set cmux visual status (argv-based safe commands)
+    safeCmux(["set-status", "race", `🏃 ${runners.length} racing`, "--icon", "figure.run", "--color", "#ff9500"]);
+    safeCmux(["set-progress", "0.1", "--label", `Race: ${goal.slice(0, 30)}...`]);
 
     // 2. Spawn runner splits atomically
     for (let i = 0; i < runners.length; i++) {
+      if (signal?.aborted) {
+        throw new Error("Race aborted during runner launch");
+      }
+
       const r = runners[i];
       const logFile = join(raceDir, `${r.name}.log`);
       const exitFile = join(raceDir, `${r.name}.exit`);
       const doneFile = join(raceDir, `${r.name}.done`);
       const scriptFile = join(raceDir, `${r.name}.sh`);
 
-      // Write wrapper script that executes the command and emits completion signal
+      // Wrapper script with safe directory check
+      const escapedCwd = cwd.replace(/(["$`\\])/g, "\\$1");
       const scriptContent = `#!/bin/bash
-cd "${cwd}"
+cd "${escapedCwd}" || exit 1
 (${r.command}) > "${logFile}" 2>&1
 echo $? > "${exitFile}"
 touch "${doneFile}"
 `;
       writeFileSync(scriptFile, scriptContent, { mode: 0o755 });
 
-      // Atomic split creation avoids send-after-create race
+      // Atomic split creation
       const out = safeCmux([
         "new-split",
         i === 0 ? "right" : "down",
         "--command",
-        `"bash '${scriptFile}'"`,
+        `bash ${scriptFile}`,
         "--focus",
         "false",
         "--id-format",
         "both",
       ]);
 
-      // Parse surface ID from cmux output (e.g. "surface:3 (UUID)")
       const match = out.match(/([0-9a-fA-F-]{36})/);
       if (match) {
         r.surfaceId = match[1];
+        createdSurfaces.push(match[1]);
       }
       const refMatch = out.match(/(surface:\d+)/);
       if (refMatch) {
         r.surfaceRef = refMatch[1];
+        if (!r.surfaceId) createdSurfaces.push(refMatch[1]);
       }
     }
 
-    // 3. Polling race loop (Wait-for-first-winner)
+    // 3. Polling race loop (Wait-for-first-winner with timestamp ordering)
     let winner: RaceRunnerConfig | null = null;
-    const maxMs = timeoutSeconds * 1000;
 
-    while (Date.now() - startTime < maxMs) {
+    while (Date.now() < deadline) {
       if (signal?.aborted) {
         throw new Error("Race aborted by caller");
       }
+
+      const completedRunners: RaceRunnerConfig[] = [];
 
       for (const r of runners) {
         const doneFile = join(raceDir, `${r.name}.done`);
         const exitFile = join(raceDir, `${r.name}.exit`);
 
         if (existsSync(doneFile) && existsSync(exitFile)) {
-          const exitCode = readFileSync(exitFile, "utf8").trim();
-          if (exitCode === "0") {
-            // Optional verification check (e.g. npm test)
-            let verifyPass = true;
-            if (verifyCmd) {
-              try {
-                execSync(verifyCmd, { cwd, stdio: "ignore", timeout: 15000 });
-              } catch {
-                verifyPass = false;
-              }
-            }
-
-            if (verifyPass) {
-              winner = r;
-              break;
+          if (!r.completedAt) {
+            try {
+              r.completedAt = statSync(doneFile).mtimeMs;
+            } catch {
+              r.completedAt = Date.now();
             }
           }
+          const exitCode = readFileSync(exitFile, "utf8").trim();
+          if (exitCode === "0") {
+            completedRunners.push(r);
+          }
+        }
+      }
+
+      // Sort by earliest completed timestamp to eliminate array-order bias
+      completedRunners.sort((a, b) => (a.completedAt || 0) - (b.completedAt || 0));
+
+      for (const candidate of completedRunners) {
+        let verifyPass = true;
+        if (verifyCmd) {
+          try {
+            execSync(verifyCmd, { cwd, stdio: "ignore", timeout: 15000 });
+          } catch {
+            verifyPass = false;
+          }
+        }
+
+        if (verifyPass) {
+          winner = candidate;
+          break;
         }
       }
 
       if (winner) break;
 
-      // Update progress in cmux sidebar
       const elapsed = Date.now() - startTime;
-      const pct = Math.min(0.9, (elapsed / maxMs)).toFixed(2);
-      safeCmux(["set-progress", pct, "--label", `"Racing: ${Math.round(elapsed / 1000)}s elapsed"`]);
+      const pct = Math.min(0.9, elapsed / maxMs).toFixed(2);
+      safeCmux(["set-progress", pct, "--label", `Racing: ${Math.round(elapsed / 1000)}s elapsed`]);
 
       await new Promise((resolve) => setTimeout(resolve, 800));
     }
@@ -190,13 +218,6 @@ touch "${doneFile}"
       };
     }
 
-    // 4. Winner harvested! Clean up loser panes
-    for (const r of runners) {
-      if (r !== winner && (r.surfaceId || r.surfaceRef)) {
-        safeCmux(["close-surface", "--surface", r.surfaceId || r.surfaceRef!]);
-      }
-    }
-
     // Read winning log
     const winningLogFile = join(raceDir, `${winner.name}.log`);
     let logOutput = "";
@@ -205,11 +226,6 @@ touch "${doneFile}"
     }
     if (!logOutput && (winner.surfaceId || winner.surfaceRef)) {
       logOutput = safeCmux(["read-screen", "--surface", winner.surfaceId || winner.surfaceRef!, "--lines", "60"]);
-    }
-
-    // Close winner pane as well after reading
-    if (winner.surfaceId || winner.surfaceRef) {
-      safeCmux(["close-surface", "--surface", winner.surfaceId || winner.surfaceRef!]);
     }
 
     // 5. TypeSafe Jev quality evaluation on winning solution
@@ -234,8 +250,10 @@ touch "${doneFile}"
         });
         if (res.ok) {
           const json = (await res.json()) as any;
-          const validScore = json?.answers?.is_valid_solution?.noul ?? 0.8;
-          jevText = `Jev confidence: ${Math.round(validScore * 100)}%`;
+          const validScore = json?.answers?.is_valid_solution?.noul;
+          if (typeof validScore === "number" && Number.isFinite(validScore)) {
+            jevText = `Jev confidence: ${Math.round(validScore * 100)}%`;
+          }
         }
       } catch {}
     }
@@ -252,6 +270,11 @@ touch "${doneFile}"
       durationMs,
     };
   } finally {
+    // Unconditional runner teardown: close all created surfaces so no orphaned panes remain
+    for (const surface of createdSurfaces) {
+      safeCmux(["close-surface", "--surface", surface]);
+    }
+
     // Always clear cmux status and clean temporary race files
     safeCmux(["clear-status", "race"]);
     safeCmux(["clear-progress"]);
@@ -262,7 +285,7 @@ touch "${doneFile}"
 }
 
 export default function (pi: ExtensionAPI) {
-  // 1. Tool: cmux_race
+  // 1. Tool: cmux_race (conforming to Pi's 5-argument execute signature)
   pi.registerTool({
     name: "cmux_race",
     label: "cmux Parallel Race-and-Notify",
@@ -283,7 +306,7 @@ export default function (pi: ExtensionAPI) {
         Type.Number({ description: "Max seconds before aborting race (default: 120)" }),
       ),
     }),
-    async execute(_id, params, ctx: ExtensionContext) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       if (!isCmuxActive()) {
         return {
           content: [
@@ -295,14 +318,17 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      ctx.ui?.notify?.(`[cmux-race] Starting race across ${params.runnerCommands.length} runners...`, "info");
+      const effectiveCtx: ExtensionContext | undefined = ctx || (signal && (signal as any).cwd ? (signal as any) : undefined);
+      const effectiveSignal: AbortSignal | undefined = signal instanceof AbortSignal ? signal : effectiveCtx?.signal;
+
+      effectiveCtx?.ui?.notify?.(`[cmux-race] Starting race across ${params.runnerCommands.length} runners...`, "info");
       const result = await runCmuxRace(
         params.goal,
         params.runnerCommands,
         params.verifyCommand,
         params.timeoutSeconds || 120,
-        ctx.cwd || process.cwd(),
-        ctx.signal,
+        effectiveCtx?.cwd || process.cwd(),
+        effectiveSignal,
       );
 
       if (result.error) {

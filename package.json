@@ -1,16 +1,16 @@
 {
   "name": "pi-cmux-race",
-  "version": "1.0.0",
-  "description": "Competitive multi-agent race-and-notify orchestration inside cmux for Pi Coding Agent",
+  "version": "1.0.1",
+  "description": "Atomic parallel competitive runner orchestration in cmux for Pi Coding Agent",
   "main": "index.ts",
   "scripts": {
-    "test": "node --input-type=module test.ts"
+    "test": "bun run test.ts"
   },
   "keywords": [
     "pi-extension",
     "cmux",
     "race-and-notify",
-    "multi-agent",
+    "parallel",
     "orchestration",
     "indydevdan"
   ],
