@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCmuxRace, runBounded, killGroup } from "./index.ts";
+import { runCmuxRace, runBounded, killGroup, procsUnder } from "./index.ts";
 import { spawn } from "node:child_process";
 
 delete process.env.TYPESAFE_API_KEY;
@@ -193,6 +193,46 @@ exit 0
   assert.doesNotThrow(() => process.kill(stranger.pid!, 0), "stranger must still be alive");
   process.kill(stranger.pid!, "SIGKILL");
   console.log("✓ killGroup refuses a group it does not own");
+}
+
+// A verifier that returns at once but leaves a background child with closed pipes: the child is killed
+// (still in the verifier's group), with a warning
+{
+  const pidf = join(tmp, "verify-straggler.pid");
+  const res = await runCmuxRace("verify straggler", ["true"], `python3 -c 'import os,sys,time; open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(23.9)' '${pidf}' >/dev/null 2>&1 & sleep 0.3; false`, 5, repo);
+  const pid = Number(readFileSync(pidf, "utf8"));
+  let alive = true;
+  try { process.kill(pid, 0); } catch { alive = false; }
+  if (alive) process.kill(pid, "SIGKILL");
+  assert.ok(!alive, "a verifier's closed-pipe background child must be killed");
+  assert.ok(res.cleanupWarnings.some((w) => /left background processes; they were killed/.test(w)), JSON.stringify(res.cleanupWarnings));
+  assert.equal(g("worktree", "list").split("\n").length, 1, "nothing left running there, so the worktree is removed");
+  console.log("✓ verifier's closed-pipe background child: killed, warned");
+}
+
+// A setsid escapee with closed pipes cannot be reached by the group kill: its worktree is kept, with its pid
+{
+  const pidf = join(tmp, "verify-silent-escapee.pid");
+  const res = await runCmuxRace("silent escape", ["true"], `python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); time.sleep(25.3)' '${pidf}' >/dev/null 2>&1 & sleep 0.3; false`, 5, repo);
+  const pid = Number(readFileSync(pidf, "utf8"));
+  try { process.kill(pid, "SIGKILL"); } catch {}
+  assert.ok(res.cleanupWarnings.some((w) => w.includes(`processes ${pid} are still running in`)), JSON.stringify(res.cleanupWarnings));
+  const kept = g("worktree", "list").split("\n");
+  assert.equal(kept.length, 2, "the worktree a live process works in is kept");
+  g("worktree", "remove", "--force", kept[1].split(/\s+/)[0]);
+  console.log("✓ silent setsid escapee: worktree kept, its pid reported");
+}
+
+// A group whose leader is gone proves nothing (its id may be recycled): never signalled
+{
+  const orphan = spawn("bash", ["-c", "sleep 43.7 & echo $!"], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+  const memberPid = Number(await new Promise<string>((r) => orphan.stdout!.once("data", (d) => r(String(d)))));
+  await new Promise((r) => setTimeout(r, 300)); // leader exited and was reaped; its member lives on
+  assert.equal(await killGroup(orphan.pid!, tmp), "foreign");
+  assert.doesNotThrow(() => process.kill(memberPid, 0), "member of an unproven group must not be signalled");
+  process.kill(memberPid, "SIGKILL");
+  assert.deepEqual(procsUnder(join(tmp, "definitely-not-a-dir")), []);
+  console.log("✓ killGroup refuses a group whose leader is gone; procsUnder finds nothing in an unused dir");
 }
 
 console.log("\nRACE E2E PASSED");
