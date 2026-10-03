@@ -17,9 +17,18 @@ When facing hard bugs, stubborn test failures, or exploratory refactors, a singl
 
 ## Isolation and verification
 
-When the working directory is inside a git repo, each runner gets its own detached worktree at `HEAD`, so runners can't overwrite each other and `verifyCommand` checks the candidate it is judging. **Uncommitted changes are not carried into the worktrees.** The winner's worktree is kept and its path reported, so you can inspect or merge it. Losers' worktrees are removed. Outside a git repo, runners share the directory and the result says so.
+Inside a git repo, each runner gets its own detached worktree at `HEAD`, so runners can't overwrite each other and `verifyCommand` checks the candidate it is judging. Isolation **fails closed**: if any worktree can't be created, or the repo has no commits, the race refuses to start rather than run in your checkout. Runners start from the same subdirectory as your cwd.
 
-Each finished runner is verified at most once. Verification runs asynchronously and is capped by the race deadline, so a winner verified after the deadline is never accepted. Each runner command is written to its own script file, so its syntax can't break the wrapper.
+Things worktrees don't carry over:
+- uncommitted changes
+- untracked directories
+- initialised submodule content (bootstrap it in the runner command if needed)
+
+The winner's worktree root is kept and reported, so you can inspect or merge it. Losers' worktrees are removed. Outside a git repo, runners share the directory and the result says so.
+
+Each finished runner is verified at most once. Verification runs asynchronously in its own process group, capped by the race deadline. On expiry or abort the whole group gets SIGTERM, then SIGKILL after 2 s. A timed-out verify never counts as a pass.
+
+Teardown doesn't trust pane closure. Every runner that hasn't finished is killed along with its descendant processes, and any survivor is reported as a cleanup warning.
 
 ## Verification
 

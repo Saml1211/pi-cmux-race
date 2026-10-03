@@ -9,7 +9,9 @@ import { runCmuxRace } from "./index.ts";
 delete process.env.TYPESAFE_API_KEY;
 const tmp = realpathSync(mkdtempSync(join(tmpdir(), "race-e2e-")));
 const fake = join(tmp, "fake-cmux");
+const callLog = join(tmp, "cmux-calls.log");
 writeFileSync(fake, `#!/bin/bash
+echo "$1" >> '${callLog}'
 if [ "$1" = new-split ]; then
   while [ $# -gt 0 ]; do [ "$1" = --command ] && { nohup bash -c "$2" >/dev/null 2>&1 & break; }; shift; done
   echo "OK surface:9 $(uuidgen)"
@@ -63,4 +65,45 @@ const n = await runCmuxRace("plain", ["true", "sleep 5"], undefined, 10, plain);
 assert.equal(n.winner!.name, "runner-1");
 assert.equal(n.isolated, false);
 console.log("✓ non-git cwd runs shared and says so");
+const g2 = (cwd: string, ...a: string[]) => execFileSync("git", a, { cwd, encoding: "utf8" }).trim();
+const pg = (pat: string) => { try { return execFileSync("pgrep", ["-f", pat], { encoding: "utf8" }).trim(); } catch { return ""; } };
+
+// Orphans: fake close-surface kills nothing, so only the extension's own teardown can stop runners
+const o = await runCmuxRace("orphans", ["sleep 31.7", "sleep 31.7"], undefined, 5, repo);
+assert.match(o.error ?? "", /timed out/);
+await new Promise((r) => setTimeout(r, 300));
+assert.equal(pg("sleep 31.7"), "", "runners must be killed even when pane closure does nothing");
+console.log("✓ unfinished runners killed by the extension (pane closure not trusted)");
+
+// Verify that ignores SIGTERM: no winner, bounded by deadline + kill escalation, no stragglers
+const v = await runCmuxRace("stubborn verify", ["true"], "trap '' TERM; sleep 4.3", 5, repo);
+assert.ok(!v.winner, "a verify that outlives the deadline must not produce a winner");
+assert.ok(v.durationMs < 9500, `race not bounded: ${v.durationMs} ms`);
+await new Promise((r) => setTimeout(r, 300));
+assert.equal(pg("sleep 4.3"), "", "verify process group must be killed");
+console.log(`✓ TERM-ignoring verify: no winner, bounded (${v.durationMs} ms), group killed`);
+
+// Nested cwd: worktree reported is the ROOT (git worktree remove accepts it)
+execFileSync("mkdir", ["-p", join(repo, "sub/dir")]);
+writeFileSync(join(repo, "sub/dir/.keep"), ""); g("add", "sub"); g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "sub"); // worktrees come from HEAD
+const nested = await runCmuxRace("nested", ["pwd > where.txt"], undefined, 10, join(repo, "sub/dir"));
+assert.ok(nested.winner!.worktree, "winner worktree reported");
+assert.ok(existsSync(join(nested.winner!.worktree!, "sub/dir/where.txt")), "runner ran in the nested dir of its worktree");
+g2(repo, "worktree", "remove", "--force", nested.winner!.worktree!); // throws if not a worktree root
+console.log("✓ nested cwd: runner ran in sub/dir, reported path is the worktree root");
+
+// Fail closed: worktree creation impossible -> error, no panes, checkout untouched
+const before = readFileSync(callLog, "utf8").split("\n").filter((l) => l === "new-split").length;
+execFileSync("bash", ["-c", "rm -rf .git/worktrees && touch .git/worktrees"], { cwd: repo });
+const f = await runCmuxRace("no isolation possible", ["echo pwned > pwned.txt", "true"], undefined, 10, repo);
+execFileSync("rm", ["-f", join(repo, ".git/worktrees")]);
+assert.match(f.error ?? "", /isolated worktree/);
+assert.ok(!existsSync(join(repo, "pwned.txt")), "must never run in the caller's checkout");
+assert.equal(readFileSync(callLog, "utf8").split("\n").filter((l) => l === "new-split").length, before, "no panes spawned");
+const empty = join(tmp, "empty");
+execFileSync("mkdir", ["-p", empty]); g2(empty, "init", "-q");
+const e = await runCmuxRace("no commits", ["true", "true"], undefined, 10, empty);
+assert.match(e.error ?? "", /no commits/);
+console.log("✓ fail closed: worktree failure and commitless repo refuse to run (no panes, checkout untouched)");
+
 console.log("\nRACE E2E PASSED");
