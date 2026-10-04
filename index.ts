@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdtempSync, statSync, realpathSync } from "node:fs";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import os from "node:os";
@@ -66,9 +66,8 @@ export interface RaceRunnerConfig {
 }
 
 
-export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean; strays: boolean }
+export interface BoundedResult { code: number | null; out: string; timedOut: boolean; aborted: boolean; escaped: boolean; strays: boolean; foreign: boolean }
 const win = process.platform === "win32";
-const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 
 // Run a shell command in its own process group; on timeout/abort kill the WHOLE group (TERM, then
 // KILL after 2 s), so descendants can't outlive it and a timed-out command can never count as a pass.
@@ -76,21 +75,56 @@ const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } c
 // call also settles 5 s after the first kill signal no matter what, closing its pipes and reporting escaped: true.
 // A command that exits normally but leaves background processes in its group (pipes closed, so 'close'
 // still fires) has them killed too, reported as strays: true.
+// A signal is only sent to a group we can prove is ours (see keepAnchor); a group that outlived its leader
+// without that proof is left alone and reported as foreign: true.
 // On native Windows there are no process groups: bash is Pi's configured shell (never WSL's bash.exe), the
 // tree is killed with `taskkill /F /T` for both stages, and strays are not detected.
 // ponytail: taskkill /T cannot reach processes that left the tree (Pi issue #9129); the 5 s settle still bounds the call.
 // ponytail: duplicated in pi-adw (separate repos); setsid escapees are reported, not hunted down.
-async function winShell(): Promise<string> {
+// Pi's project-trust rule, read-only: the nearest trust.json entry for the project or an ancestor decides.
+// ponytail: a trust decision Pi holds only in memory (this session, --trust-project) is invisible here, so that
+// project's settings are ignored; upgrade path is passing ctx.isProjectTrusted() down from the tool call.
+const projectTrusted = (agentDir: string, cwd: string): boolean => {
+  try {
+    const trust = JSON.parse(readFileSync(join(agentDir, "trust.json"), "utf8"));
+    for (let d = realpathSync(resolvePath(cwd)); ; d = dirname(d)) {
+      if (typeof trust[d] === "boolean") return trust[d];
+      if (dirname(d) === d) return false;
+    }
+  } catch { return false; }
+};
+// The shell Pi itself would use: Pi's merged global + (trusted) project settings, shellPath normalised.
+export async function winShell(): Promise<string> {
   const pi: any = await import("@earendil-works/pi-coding-agent");
   let shellPath: string | undefined;
-  try { shellPath = JSON.parse(readFileSync(join(pi.getAgentDir(), "settings.json"), "utf8")).shellPath; } catch {}
+  try {
+    const agentDir = pi.getAgentDir(), cwd = process.cwd();
+    shellPath = pi.SettingsManager.create(cwd, agentDir, { projectTrusted: projectTrusted(agentDir, cwd) }).getShellPath();
+  } catch {}
   const sh = pi.getShellConfig(shellPath);
   if (sh.commandTransport === "stdin") throw new Error("only WSL bash found; install Git for Windows or set shellPath in Pi settings.json");
   return sh.shell;
 }
+// Pids in process group pgid, never the leader itself (its pid IS the id, so a recycled group would match it); [] if ps fails.
+const groupMembers = (pgid: number): number[] => {
+  try {
+    return execFileSync("ps", ["-axo", "pid=,pgid="], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] })
+      .split("\n").map((l) => l.trim().split(/\s+/).map(Number)).filter(([p, g]) => g === pgid && p !== pgid).map(([p]) => p);
+  } catch { return []; }
+};
+// Ownership anchor: a group id is only recycled once the group is empty, so while a member we saw in the group
+// is still in it, it is the same group. Returns the refreshed member list, or null when that cannot be shown.
+// ponytail: a member pid recycled into a recycled group would fool this; needs two pid wraps inside one cleanup.
+const keepAnchor = (anchor: number[], pgid: number): number[] | null => {
+  const now = groupMembers(pgid);
+  return now.some((p) => anchor.includes(p)) ? now : null;
+};
 export async function runBounded(cmd: string, o: { cwd: string; timeoutMs: number; signal?: AbortSignal; maxBytes?: number }): Promise<BoundedResult> {
+  const none = (out: string, aborted: boolean): BoundedResult => ({ code: null, out, timedOut: false, aborted, escaped: false, strays: false, foreign: false });
+  if (o.signal?.aborted) return none("", true); // already cancelled: never start it
   let shell = "bash";
-  if (win) try { shell = await winShell(); } catch (e: any) { return { code: null, out: `runBounded: ${e?.message ?? e}`, timedOut: false, aborted: false, escaped: false, strays: false }; }
+  if (win) try { shell = await winShell(); } catch (e: any) { return none(`runBounded: ${e?.message ?? e}`, false); }
+  if (o.signal?.aborted) return none("", true); // cancelled while the shell was resolved (no await between here and spawn)
   return new Promise((resolve) => {
     const child = spawn(shell, ["-c", cmd], { cwd: o.cwd, detached: !win, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     const max = o.maxBytes ?? 10 * 1024 * 1024;
@@ -106,15 +140,23 @@ export async function runBounded(cmd: string, o: { cwd: string; timeoutMs: numbe
     };
     child.stdout!.on("data", add);
     child.stderr!.on("data", add);
-    let timedOut = false, aborted = false, escaped = false, done = false;
+    let timedOut = false, aborted = false, escaped = false, foreign = false, done = false;
     let killTimer: NodeJS.Timeout | undefined, settleTimer: NodeJS.Timeout | undefined;
-    // A PGID is only reused once its group is empty, and the new group's leader has pid == pgid. So once
-    // our leader has been reaped, a live process with that pid means the id is someone else's: hands off.
+    const reaped = () => child.exitCode !== null || child.signalCode !== null;
+    // While our leader is unreaped its pid (= the group id) cannot be recycled. Once it is reaped, the members
+    // seen at that moment anchor the group: remembered at 'exit' and re-proven before every signal.
+    let anchor: number[] = [];
+    child.on("exit", () => { if (!win && groupAlive(child.pid!)) anchor = groupMembers(child.pid!); });
+    const mine = () => {
+      if (!reaped()) return true;
+      const kept = keepAnchor(anchor, child.pid!);
+      if (kept) anchor = kept;
+      return !!kept;
+    };
     const group = (sig: NodeJS.Signals) => {
-      const reaped = child.exitCode !== null || child.signalCode !== null;
-      if (win) { if (!reaped) execFile(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true }, () => {}); return; }
-      if (reaped && pidAlive(child.pid!)) return;
-      try { process.kill(-child.pid!, sig); } catch {}
+      if (win) { if (!reaped()) execFile(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), ["/F", "/T", "/PID", String(child.pid)], { windowsHide: true }, () => {}); return; }
+      if (mine()) { try { process.kill(-child.pid!, sig); } catch {} }
+      else if (groupAlive(child.pid!)) foreign = true;
     };
     const finish = (code: number | null) => {
       if (done) return;
@@ -122,14 +164,16 @@ export async function runBounded(cmd: string, o: { cwd: string; timeoutMs: numbe
       clearTimeout(timer);
       clearTimeout(settleTimer);
       o.signal?.removeEventListener("abort", onAbort);
-      // Members left in the group: the id cannot be reused while they live, so it is still ours.
-      const strays = !win && !killTimer && groupAlive(child.pid!);
+      // Members left in the group: the id cannot be reused while they live, so it is ours if the anchor holds.
+      const live = !win && groupAlive(child.pid!);
+      const ours = live && mine();
+      const strays = ours && !killTimer;
       if (killTimer) { clearTimeout(killTimer); group("SIGKILL"); } // sweep stragglers still in the group
-      const out = Buffer.concat(chunks).toString("utf8") + (truncated ? "\n… (output truncated)" : "");
-      const result = { code, out, timedOut, aborted, escaped, strays };
-      if (!strays) return resolve(result);
+      else if (live && !ours) foreign = true;
+      const result = () => ({ code, out: Buffer.concat(chunks).toString("utf8") + (truncated ? "\n… (output truncated)" : ""), timedOut, aborted, escaped, strays, foreign });
+      if (!strays) return resolve(result());
       group("SIGTERM");
-      setTimeout(() => { group("SIGKILL"); resolve(result); }, 500);
+      setTimeout(() => { group("SIGKILL"); resolve(result()); }, 500);
     };
     const stop = () => {
       group("SIGTERM");
@@ -157,6 +201,7 @@ const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true
 // (it waits for its .pgid file to disappear), so a live leader whose argv carries our race dir is the
 // proof the group is ours. A missing or zombie leader proves nothing (the id may have been recycled
 // by an unrelated group whose own leader then exited), so that group is left alone and reported.
+const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch (e: any) { return e?.code === "EPERM"; } };
 function ownsGroup(pgid: number, marker: string): boolean {
   if (!pidAlive(pgid)) return false;
   let ps = "";
@@ -168,10 +213,18 @@ export async function killGroup(pgid: number, marker: string): Promise<"gone" | 
   // a leader that just exited (cancel marker) may still be a zombie for a moment: let it be reaped
   for (let i = 0; i < 10 && groupAlive(pgid) && !ownsGroup(pgid, marker); i++) await new Promise((r) => setTimeout(r, 100));
   if (!groupAlive(pgid)) return "gone";
-  if (!ownsGroup(pgid, marker)) return "foreign";
-  // Proven ours once; the id cannot be reused until every member is gone, so it stays ours while alive.
+  // Ownership is re-proven before EACH signal, never carried over the polling: while the leader is live it
+  // proves the group (and refreshes the members that will outlive it); once TERM has taken the leader, only a
+  // member seen earlier still in the group does (keepAnchor). No proof = foreign: left alone, reported.
+  let anchor: number[] = [];
   for (const [sig, polls] of [["SIGTERM", 10], ["SIGKILL", 5]] as const) {
     if (!groupAlive(pgid)) break;
+    if (ownsGroup(pgid, marker)) anchor = groupMembers(pgid);
+    else {
+      const kept = keepAnchor(anchor, pgid);
+      if (!kept) return "foreign";
+      anchor = kept;
+    }
     try { process.kill(-pgid, sig); } catch {}
     for (let i = 0; i < polls && groupAlive(pgid); i++) await new Promise((r) => setTimeout(r, 100));
   }
@@ -395,6 +448,10 @@ wait $!
           const v = await runBounded(verifyCmd, { cwd: candidate.workdir!, timeoutMs: Math.min(60000, remaining), signal });
           verifyPass = v.code === 0 && !v.timedOut && !v.aborted;
           if (v.strays) cleanupWarnings.push(`${candidate.name}: the verify command left background processes; they were killed`);
+          if (v.foreign) {
+            if (candidate.worktreeRoot) keptWorktrees.add(candidate.worktreeRoot);
+            cleanupWarnings.push(`${candidate.name}: a process group left by the verify command could not be proven ours, so it was not signalled${candidate.worktreeRoot ? "; its worktree was kept" : ""}`);
+          }
           if (v.escaped) {
             if (candidate.worktreeRoot) keptWorktrees.add(candidate.worktreeRoot);
             cleanupWarnings.push(`${candidate.name}: a verify process left its process group and may still be running in ${candidate.worktreeRoot ?? candidate.workdir}${candidate.worktreeRoot ? "; that worktree was kept" : ""}`);

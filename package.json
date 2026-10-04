@@ -1,6 +1,6 @@
 {
   "name": "pi-cmux-race",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Atomic parallel competitive runner orchestration in cmux for Pi Coding Agent",
   "main": "index.ts",
   "scripts": {

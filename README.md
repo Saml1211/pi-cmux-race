@@ -26,7 +26,7 @@ Things worktrees don't carry over:
 
 The winner's worktree root is kept and reported, so you can inspect or merge it. Losers' worktrees are removed. Outside a git repo, runners share the directory and the result says so.
 
-Each finished runner is verified at most once. Verification runs asynchronously in its own process group, capped by the race deadline. On expiry or abort the whole group gets SIGTERM, then SIGKILL after 2 s. A timed-out verify never counts as a pass.
+Each finished runner is verified at most once. Verification runs asynchronously in its own process group, capped by the race deadline. On expiry or abort the whole group gets SIGTERM, then SIGKILL after 2 s. A timed-out verify never counts as a pass. A group that outlives its leader is signalled only while a member seen in it is still in it (re-checked before every signal); otherwise nothing is sent and a cleanup warning is added, with the worktree kept. Teardown's `killGroup` proves ownership the same way before TERM and again before KILL.
 
 Each runner command runs in its own process group (the wrapper uses `set -m`). The group's leader records its id *before* running anything, and it refuses to start once teardown has begun. Teardown drops that cancel marker first, so a runner can never execute unowned, even if teardown lands mid-launch.
 
@@ -43,4 +43,4 @@ bun run test.ts       # unit
 bun run race.e2e.ts   # real race loop + real git worktrees, fake cmux via PI_CMUX_BIN (no panes opened)
 ```
 
-**Windows:** `runBounded` runs verify commands in Pi's configured bash (settings.json `shellPath`, else Git Bash; WSL's `bash.exe` is refused with a clear error), kills the process tree with `taskkill /F /T`, and does not detect stray background processes.
+**Windows:** `runBounded` runs verify commands in the bash Pi itself would use (Pi's merged settings: global `shellPath`, overridden by the project's `.pi/settings.json` only when `trust.json` trusts the project, else Git Bash; WSL's `bash.exe` is refused with a clear error), kills the process tree with `taskkill /F /T`, and does not detect stray background processes. A trust decision Pi holds only in memory (this session, `--trust-project`) is not visible to the extension, so that project's `shellPath` is ignored. A signal that is already aborted never starts the command, including one aborted while the shell is being resolved.
